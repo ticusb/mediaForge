@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up environment
+        run: echo "No build steps configured yet; this is a CI stub."
+      - name: Run lint (placeholder)
+        run: echo "lint: none"
+      - name: Run tests (placeholder)
+        run: echo "tests: none"

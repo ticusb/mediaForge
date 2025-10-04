@@ -1,0 +1,32 @@
+[package]
+name = "media-processor-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+
+# Web framework
+axum = { version = "0.7", features = ["multipart"] }
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+hyper = "1.4"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Utilities
+uuid = { version = "1.10", features = ["v4", "serde"] }
+bytes = "1.7"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Optional: Better MIME type detection
+# infer = "0.16"
+
+# Optional: For production-ready error handling
+# thiserror = "1.0"
+# anyhow = "1.0"

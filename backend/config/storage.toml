@@ -1,0 +1,8 @@
+# Storage configuration
+# Use local or s3
+mode = "local" # or "s3"
+local_base = "./data/uploads"
+
+[s3]
+endpoint = "http://localhost:9000"
+bucket = "mediaforge"
