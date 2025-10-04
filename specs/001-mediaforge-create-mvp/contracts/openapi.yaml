@@ -1,0 +1,51 @@
+openapi: 3.0.0
+info:
+  title: MediaForge MVP API (spec skeleton)
+  version: 0.1.0
+paths:
+  /api/upload:
+    post:
+      summary: Upload a media file
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                options:
+                  type: string
+      responses:
+        '200':
+          description: Upload accepted
+  /api/convert:
+    post:
+      summary: Convert or process media
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                jobType:
+                  type: string
+                parameters:
+                  type: object
+      responses:
+        '200':
+          description: Job queued
+  /api/status/{jobId}:
+    get:
+      summary: Check job status
+      parameters:
+        - in: path
+          name: jobId
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Job status
+servers:
+  - url: https://api.example.com
