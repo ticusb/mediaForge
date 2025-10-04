@@ -49,6 +49,11 @@
 
 [Gates determined based on constitution file]
 
+Checks include (non-exhaustive):
+- Data retention & ephemeral storage validation (ensure feature respects configured retention limits, default 24h).
+- Observability & metrics validation (ensure required metrics and health endpoints are defined for SLA tracking).
+- Privacy & encryption checks (uploads encrypted in transit and at rest).
+
 ## Project Structure
 
 ### Documentation (this feature)

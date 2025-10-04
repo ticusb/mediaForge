@@ -68,6 +68,8 @@
 - [ ] T016 Auth middleware
 - [ ] T017 Request/response logging
 - [ ] T018 CORS and security headers
+ - [ ] T019 Ephemeral cleanup job (delete expired media assets)
+ - [ ] T020 Instrument SLA metrics (jobs/sec, processing latency, error rates)
 
 ## Phase 3.5: Polish
 - [ ] T019 [P] Unit tests for validation in tests/unit/test_validation.py
