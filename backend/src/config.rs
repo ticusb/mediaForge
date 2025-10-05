@@ -37,6 +37,7 @@ pub struct ProcessingConfig {
     pub max_image_size_mb: u64,
     pub max_video_size_mb: u64,
     pub max_video_duration_seconds: u32,
+    pub lut_max_size_mb: u64,
     pub model_path: String,
     pub temp_dir: String,
 }
@@ -89,6 +90,9 @@ impl Config {
                     .parse()?,
                 max_video_duration_seconds: env::var("MAX_VIDEO_DURATION_SECONDS")
                     .unwrap_or_else(|_| "30".to_string())
+                    .parse()?,
+                lut_max_size_mb: env::var("LUT_MAX_SIZE_MB")
+                    .unwrap_or_else(|_| "1".to_string())
                     .parse()?,
                 model_path: env::var("MODEL_PATH")
                     .unwrap_or_else(|_| "./models/u2net.onnx".to_string()),

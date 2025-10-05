@@ -170,15 +170,25 @@ async fn process_background_removal(
         .get("replace_color")
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
-    // Process image
-    if let Some(color) = replace_color {
+    // Process image or video
+    let lower = input_path.to_string_lossy().to_lowercase();
+    let is_video = lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".avi") || lower.ends_with(".webm");
+
+    if is_video {
+        // For MVP, extract first frame and remove background on it
         processor
-            .replace_background(&input_path, &output_path, color)
-            .map_err(|e| format!("Background replacement failed: {:?}", e))?;
+            .remove_background_from_video(&input_path, &output_path)
+            .map_err(|e| format!("Background removal failed (video): {:?}", e))?;
     } else {
-        processor
-            .remove_background(&input_path, &output_path)
-            .map_err(|e| format!("Background removal failed: {:?}", e))?;
+        if let Some(color) = replace_color {
+            processor
+                .replace_background(&input_path, &output_path, color)
+                .map_err(|e| format!("Background replacement failed: {:?}", e))?;
+        } else {
+            processor
+                .remove_background(&input_path, &output_path)
+                .map_err(|e| format!("Background removal failed: {:?}", e))?;
+        }
     }
 
     update_progress(statuses, &job.job_id, 80).await;
@@ -310,7 +320,12 @@ async fn process_color_grade(
     update_progress(statuses, &job.job_id, 20).await;
 
     // Check for preset or manual adjustments
-    if let Some(preset) = job_record.parameters.get("preset").and_then(|v| v.as_str()) {
+    if let Some(lut_loc) = job_record.parameters.get("lut_location").and_then(|v| v.as_str()) {
+        // Apply LUT (if present)
+        processor
+            .apply_lut(&input_path, &output_path, lut_loc)
+            .map_err(|e| format!("LUT application failed: {:?}", e))?;
+    } else if let Some(preset) = job_record.parameters.get("preset").and_then(|v| v.as_str()) {
         processor
             .apply_preset(&input_path, &output_path, preset)
             .map_err(|e| format!("Preset application failed: {:?}", e))?;

@@ -194,6 +194,8 @@ pub struct ConvertRequest {
     pub asset_id: String,
     pub output_format: String,
     #[serde(default)]
+    pub lut_location: Option<String>,
+    #[serde(default)]
     pub width: Option<u32>,
     #[serde(default)]
     pub height: Option<u32>,
@@ -227,6 +229,7 @@ pub async fn convert(
         "convert",
         json!({
             "output_format": payload.output_format,
+            "lut_location": payload.lut_location,
             "width": payload.width,
             "height": payload.height,
         }),
@@ -319,6 +322,8 @@ pub struct ColorGradeRequest {
     #[serde(default)]
     pub preset: Option<String>,
     #[serde(default)]
+    pub lut_location: Option<String>,
+    #[serde(default)]
     pub hue: Option<i32>,
     #[serde(default)]
     pub saturation: Option<i32>,
@@ -345,6 +350,7 @@ pub async fn color_grade(
         "color_grade",
         json!({
             "preset": payload.preset,
+            "lut_location": payload.lut_location,
             "hue": payload.hue,
             "saturation": payload.saturation,
             "brightness": payload.brightness,
@@ -375,6 +381,54 @@ pub async fn color_grade(
         job_id: job.id.to_string(),
         status: "queued".to_string(),
     }))
+}
+
+// LUT upload endpoint: Accepts a single .cube file (<= configured size) and
+// returns a temporary location or registers it for user. Minimal validation here.
+pub async fn upload_lut(
+    auth_user: auth::AuthUser,
+    State(state): State<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>> {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart data: {}", e)))?
+    {
+        if let Some(file_name_ref) = field.file_name() {
+            let file_name = file_name_ref.to_string();
+            let lower = file_name.to_lowercase();
+            if !lower.ends_with(".cube") {
+                return Err(AppError::BadRequest("Only .cube LUT files are supported".to_string()));
+            }
+
+            let data = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Failed to read file: {}", e)))?;
+
+            let max_bytes = state.config.processing.lut_max_size_mb * 1024 * 1024;
+            if data.len() as u64 > max_bytes {
+                return Err(AppError::PayloadTooLarge(format!(
+                    "LUT file too large: {} MB (max {} MB)",
+                    data.len() as u64 / (1024 * 1024),
+                    max_bytes / (1024 * 1024)
+                )));
+            }
+
+            // Save LUT to storage (using same storage adapter)
+            let location = state
+                .storage
+                .save_bytes(&data, &file_name)
+                .map_err(|e| AppError::Internal(format!("Failed to save LUT: {:?}", e)))?;
+
+            tracing::info!("User {} uploaded LUT {}", auth_user.email, file_name);
+
+            return Ok(Json(json!({"location": location})))
+        }
+    }
+
+    Err(AppError::BadRequest("No LUT file provided".to_string()))
 }
 
 // ============================================================================
@@ -517,24 +571,16 @@ async fn verify_asset_ownership(
 }
 
 async fn check_quota(state: &AppState, user: &auth::AuthUser, job_type: &str) -> Result<()> {
-    let count = db::Job::get_user_jobs_today(&state.db, user.id, Some(job_type)).await?;
-
-    let limit = match (user.tier.as_str(), job_type) {
-        ("free", "image") => state.config.quotas.free_tier_image_daily as i64,
-        ("free", "video") => state.config.quotas.free_tier_video_daily as i64,
-        ("pro", "video") => state.config.quotas.pro_tier_video_daily as i64,
-        ("pro", "image") => i64::MAX, // Unlimited for pro
-        _ => i64::MAX,
-    };
-
-    if count >= limit {
-        return Err(AppError::QuotaExceeded(format!(
-            "Daily quota exceeded ({}/{}). Upgrade to Pro for unlimited access.",
-            count, limit
-        )));
+    // Use quota service for logic
+    match crate::services::quota::check_quota(&state.db, &state.config, user.id, &user.tier, job_type).await {
+        Ok(_) => (),
+        Err(e) => return Err(AppError::QuotaExceeded(format!("{} Upgrade to Pro for more capacity.", e))),
     }
 
-    Ok(())
+    match crate::services::quota::check_concurrent(&state.db, &state.config, user.id, &user.tier).await {
+        Ok(_) => Ok(()),
+        Err(e) => Err(AppError::QuotaExceeded(format!("{} Try again later.", e))),
+    }
 }
 
 fn validate_file(

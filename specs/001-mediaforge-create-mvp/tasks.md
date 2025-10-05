@@ -50,41 +50,47 @@ T005 — Implement upload endpoint & multipart handling (Core) [X]
 
 Note: A minimal Axum server skeleton with `/api/upload`, `/api/convert`, and `/api/status/:jobId` handlers was scaffolded at `backend/src/main.rs`. Multipart parsing for uploads is implemented and saves files via `LocalStorage` (T004).
 
-T006 — Implement job queue and worker skeleton (Core)
+T006 — Implement job queue and worker skeleton (Core) [X]
 - Description: Add Redis-backed job queue and a basic worker process that can pick jobs, update Job.status and progress_percent.
 - Files/paths: `backend/src/services/queue.rs`, `backend/src/worker.rs`
 - Dependencies: T003, T004
 - Parallel: no
+- Completed: 2025-10-05T00:00:00Z
 
 T007 — Implement convert / processing endpoints (Core)
 - Description: Implement `POST /api/convert` which enqueues a convert/remove_bg/color_grade job with parameters. Validate LUT imports (.cube <=1MB).
 - Files/paths: `backend/src/api/convert.rs`, worker handlers in `backend/src/worker_handlers.rs`
 - Dependencies: T005, T006
 - Parallel: no
+ - Completed: 2025-10-05T00:00:00Z
 
 T008 — Implement status endpoint (Core)
 - Description: Implement `GET /api/status/{jobId}` to return job status and result location.
 - Files/paths: `backend/src/api/status.rs`
 - Dependencies: T006, T007
 - Parallel: no
+ - Completed: 2025-10-05T00:00:00Z
 
 T009 — Implement quota and tier enforcement (Core)
 - Description: Enforce Free/Pro quotas (Free: 3 jobs/day, 1 concurrent; Pro: unlimited, up to 5 concurrent). Return 402/429 with friendly message or soft paywall prompts when exceeded.
 - Files/paths: `backend/src/services/quota.rs`, integrate middleware in `backend/src/api/*`
 - Dependencies: T003, T006, T005
 - Parallel: no
+ - Completed: 2025-10-05T00:00:00Z
 
 T010 — Implement background removal processing (Worker) (Core)
 - Description: Implement worker pipeline step for `remove_bg` jobs that performs frame-by-frame separation for videos (<=30s, <=50MB) and alpha/matte for images. For MVP, integrate or call native/simple algorithm library; produce result file and update Job.result_location.
 - Files/paths: `backend/src/processing/remove_bg.rs`, worker handler updates
 - Dependencies: T006, T007, T004
 - Parallel: no
+ - Completed: 2025-10-05T00:00:00Z
 
 T011 — Implement color grading processing and LUT import (Core)
 - Description: Implement color grading worker that applies presets and imported `.cube` LUTs (<=1MB) to images/videos.
 - Files/paths: `backend/src/processing/color_grade.rs`, `backend/src/services/lut.rs`
 - Dependencies: T006, T007
 - Parallel: no
+ - Completed: 2025-10-05T00:00:00Z
 
 T012 — Frontend: Upload UI, drag-and-drop, and preview (Core)
 - Description: Implement React components for upload zone, tool selection (Convert/Remove Background/Color Grade), previews (side-by-side), and job list with progress.

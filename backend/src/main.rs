@@ -83,8 +83,9 @@ async fn main() -> anyhow::Result<()> {
         .context("Failed to create temp directory")?;
     tracing::info!("✓ Temporary directory created");
 
-    // Initialize job queue
-    let (queue, rx) = services::Queue::new(100);
+    // Initialize job queue (pass optional redis url)
+    let redis_url_opt = if config.redis_url.is_empty() { None } else { Some(config.redis_url.as_str()) };
+    let (queue, rx) = services::Queue::new(100, redis_url_opt).await;
     let queue = Arc::new(queue);
 
     // Start worker
@@ -97,6 +98,52 @@ async fn main() -> anyhow::Result<()> {
         config.clone(),
     );
     tracing::info!("✓ Background worker started");
+
+    // If Redis is configured, spawn a poller that moves jobs from Redis list into
+    // the in-process channel so workers can pick them up.
+    if !config.redis_url.is_empty() {
+        let queue_clone = queue.clone();
+        let redis_url = config.redis_url.clone();
+        tokio::spawn(async move {
+            // Use a dedicated redis client here
+            match redis::Client::open(redis_url.as_str()) {
+                Ok(client) => match client.get_async_connection().await {
+                    Ok(mut conn) => loop {
+                        // BRPOP with 5 second timeout to allow graceful shutdown checks
+                        let res: Result<Option<(String, String)>, redis::RedisError> = redis::cmd("BRPOP")
+                            .arg("mediaforge:job_queue")
+                            .arg(5)
+                            .query_async(&mut conn)
+                            .await;
+
+                        match res {
+                            Ok(Some((_list, payload))) => {
+                                if let Ok(job) = serde_json::from_str::<crate::services::JobMessage>(&payload) {
+                                    // Insert into local channel (best-effort)
+                                    if let Err(e) = queue_clone.forward_to_local(job).await {
+                                            tracing::error!("Failed to forward job from redis to local channel: {:?}", e);
+                                        }
+                                } else {
+                                    tracing::warn!("Failed to deserialize job payload from redis");
+                                }
+                            }
+                            Ok(None) => {
+                                // timeout, continue
+                                continue;
+                            }
+                            Err(e) => {
+                                tracing::error!("Redis BRPOP error: {:?}", e);
+                                // On error, back off briefly
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+                        }
+                    },
+                    Err(e) => tracing::error!("Failed to get async redis connection: {:?}", e),
+                },
+                Err(e) => tracing::error!("Failed to create redis client: {:?}", e),
+            }
+        });
+    }
 
     // Create app state
     let state = AppState {
@@ -115,10 +162,13 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/login", post(routes::login))
         // Protected routes
         .route("/api/upload", post(routes::upload))
-        .route("/api/convert", post(routes::convert))
+    .route("/api/convert", post(routes::convert))
         .route("/api/remove-bg", post(routes::remove_bg))
+    .route("/api/lut", post(routes::upload_lut))
         .route("/api/color-grade", post(routes::color_grade))
-        .route("/api/jobs/:job_id", get(routes::get_job_status))
+    // Compatibility: OpenAPI/contract tests expect /api/status/{jobId}
+    .route("/api/status/:job_id", get(routes::get_job_status))
+    .route("/api/jobs/:job_id", get(routes::get_job_status))
         .route("/api/jobs", get(routes::list_user_jobs))
         .route("/api/download/:job_id", get(routes::download_result))
         .layer(middleware::from_fn_with_state(

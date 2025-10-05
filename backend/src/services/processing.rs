@@ -48,6 +48,39 @@ impl ImageProcessor {
         Ok(())
     }
 
+    /// For MVP: If input is a video, extract the first frame and run background
+    /// removal on that frame producing a single-image result. This is a
+    /// lightweight placeholder for full frame-by-frame processing.
+    pub fn remove_background_from_video(&self, input_path: &Path, output_path: &Path) -> Result<(), ProcessingError> {
+        // Create a temp file for extracted frame
+        let frame_path = std::env::temp_dir().join(format!("frame_{}.png", uuid::Uuid::new_v4()));
+
+        // Call ffmpeg to extract the first frame
+        let status = std::process::Command::new("ffmpeg")
+            .arg("-y")
+            .arg("-i")
+            .arg(input_path.as_os_str())
+            .arg("-frames:v")
+            .arg("1")
+            .arg(frame_path.as_os_str())
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                // Run image background removal on the extracted frame
+                let res = self.remove_background(&frame_path, output_path);
+                // cleanup
+                let _ = std::fs::remove_file(&frame_path);
+                res
+            }
+            Ok(s) => Err(ProcessingError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("ffmpeg failed with code: {}", s),
+            ))),
+            Err(e) => Err(ProcessingError::IoError(e)),
+        }
+    }
+
     /// Simple background removal using color threshold (MVP fallback)
     fn simple_bg_removal(&self, img: &DynamicImage) -> Result<RgbaImage, ProcessingError> {
         let (width, height) = img.dimensions();
@@ -293,6 +326,26 @@ impl ImageProcessor {
             _ => Err(ProcessingError::InferenceFailed(format!("Unknown preset: {}", preset))),
         }
     }
+
+    /// Apply a .cube LUT to the image. MVP behavior: verify LUT exists and copy input to output (pass-through).
+    pub fn apply_lut(&self, input_path: &Path, output_path: &Path, lut_location: &str) -> Result<(), ProcessingError> {
+        // Load LUT using the new Lut3D module
+        let lut_path = Path::new(lut_location);
+        if !lut_path.exists() {
+            return Err(ProcessingError::IoError(std::io::Error::new(std::io::ErrorKind::NotFound, "LUT file not found")));
+        }
+
+        match crate::services::lut::Lut3D::from_cube(lut_path) {
+            Ok(lut) => {
+                let img = image::open(input_path)?;
+                let out_img = lut.apply_to_image(&img);
+                out_img.save(output_path)?;
+                tracing::info!("Applied LUT {} to {} -> {}", lut_location, input_path.display(), output_path.display());
+                Ok(())
+            }
+            Err(e) => Err(ProcessingError::InferenceFailed(format!("Failed to load LUT: {}", e))),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -312,5 +365,40 @@ mod tests {
         let white = Rgba([255, 255, 255, 255]);
         let distance = processor.color_distance(&black, &white);
         assert!(distance > 400.0);
+    }
+
+    #[test]
+    fn test_apply_lut_pass_through() {
+        use std::io::Write;
+        let processor = ImageProcessor::new("./models/u2net.onnx".to_string()).unwrap();
+
+        // Create temp input image
+        let input_path = std::env::temp_dir().join("test_input.png");
+        // Create a small 1x1 PNG
+        let img = image::DynamicImage::new_rgba8(1, 1);
+        img.save(&input_path).unwrap();
+
+    // Create a valid tiny .cube LUT file
+    let lut_path = std::env::temp_dir().join("test_lut.cube");
+    let mut lf = std::fs::File::create(&lut_path).unwrap();
+    writeln!(lf, "LUT_3D_SIZE 2").unwrap();
+    writeln!(lf, "0 0 0").unwrap();
+    writeln!(lf, "1 0 0").unwrap();
+    writeln!(lf, "0 1 0").unwrap();
+    writeln!(lf, "1 1 0").unwrap();
+    writeln!(lf, "0 0 1").unwrap();
+    writeln!(lf, "1 0 1").unwrap();
+    writeln!(lf, "0 1 1").unwrap();
+    writeln!(lf, "1 1 1").unwrap();
+
+        let output_path = std::env::temp_dir().join("test_output.png");
+        let res = processor.apply_lut(&input_path, &output_path, lut_path.to_str().unwrap());
+        assert!(res.is_ok());
+        assert!(output_path.exists());
+
+        // Cleanup
+        let _ = std::fs::remove_file(input_path);
+        let _ = std::fs::remove_file(output_path);
+        let _ = std::fs::remove_file(lut_path);
     }
 }
