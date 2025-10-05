@@ -1,5 +1,9 @@
 pub mod storage;
 pub mod queue;
+pub mod processing;
+mod worker;
 
 pub use storage::{Storage, LocalStorage, S3Storage};
-pub use queue::{Queue, JobMessage, start_worker_with_status, JobStatus};
+pub use queue::{Queue, JobMessage, JobStatus};
+pub use processing::ImageProcessor;
+pub use worker::start_worker;

@@ -1,0 +1,650 @@
+use axum::{
+    extract::{Path, Multipart, State},
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    Json,
+    Extension,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use uuid::Uuid;
+
+use crate::{auth, db, AppState};
+
+// ============================================================================
+// Health Check
+// ============================================================================
+
+pub async fn health() -> impl IntoResponse {
+    Json(json!({
+        "status": "healthy",
+        "version": env!("CARGO_PKG_VERSION")
+    }))
+}
+
+// ============================================================================
+// Authentication Routes
+// ============================================================================
+
+pub async fn register(
+    Extension(state): Extension<AppState>,
+    Json(payload): Json<auth::RegisterRequest>,
+) -> Result<Json<auth::AuthResponse>, AppError> {
+    // Validate email format
+    if !payload.email.contains('@') {
+        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    }
+
+    // Check if user exists
+    if db::User::find_by_email(&state.db, &payload.email)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::Conflict("Email already registered".to_string()));
+    }
+
+    // Hash password
+    let password_hash = auth::hash_password(&payload.password)
+        .map_err(|_| AppError::Internal("Failed to hash password".to_string()))?;
+
+    // Create user (default to free tier)
+    let user = db::User::create(&state.db, &payload.email, &password_hash, "free").await?;
+
+    // Generate JWT
+    let claims = auth::Claims::new(user.id, user.email.clone(), user.subscription_tier.clone());
+    let token = claims
+        .to_token(&state.config.jwt_secret)
+        .map_err(|_| AppError::Internal("Failed to generate token".to_string()))?;
+
+    Ok(Json(auth::AuthResponse {
+        token,
+        user: auth::UserInfo {
+            id: user.id.to_string(),
+            email: user.email,
+            tier: user.subscription_tier,
+        },
+    }))
+}
+
+pub async fn login(
+    Extension(state): Extension<AppState>,
+    Json(payload): Json<auth::LoginRequest>,
+) -> Result<Json<auth::AuthResponse>, AppError> {
+    // Find user
+    let user = db::User::find_by_email(&state.db, &payload.email)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Invalid credentials".to_string()))?;
+
+    // Verify password
+    let valid = auth::verify_password(&payload.password, &user.password_hash)
+        .map_err(|_| AppError::Internal("Password verification failed".to_string()))?;
+
+    if !valid {
+        return Err(AppError::Unauthorized("Invalid credentials".to_string()));
+    }
+
+    // Generate JWT
+    let claims = auth::Claims::new(user.id, user.email.clone(), user.subscription_tier.clone());
+    let token = claims
+        .to_token(&state.config.jwt_secret)
+        .map_err(|_| AppError::Internal("Failed to generate token".to_string()))?;
+
+    Ok(Json(auth::AuthResponse {
+        token,
+        user: auth::UserInfo {
+            id: user.id.to_string(),
+            email: user.email,
+            tier: user.subscription_tier,
+        },
+    }))
+}
+
+// ============================================================================
+// Upload Route
+// ============================================================================
+
+pub async fn upload(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+    mut multipart: Multipart,
+) -> Result<Json<UploadResponse>, AppError> {
+    // Check quota
+    check_quota(&state, &auth_user, "image").await?;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::BadRequest("Invalid multipart data".to_string()))?
+    {
+        if let Some(file_name) = field.file_name() {
+            let file_name_owned = file_name.to_string();
+
+            // Read file data
+            let data = field
+                .bytes()
+                .await
+                .map_err(|_| AppError::BadRequest("Failed to read file".to_string()))?;
+
+            // Validate file
+            validate_file(&file_name_owned, &data, &state.config)?;
+
+            // Save to storage
+            let location = state
+                .storage
+                .save_bytes(&data, &file_name_owned)
+                .map_err(|_| AppError::Internal("Failed to save file".to_string()))?;
+
+            // Create media asset record
+            let asset = db::MediaAsset::create(
+                &state.db,
+                auth_user.id,
+                &file_name_owned,
+                &get_file_extension(&file_name_owned),
+                data.len() as i64,
+            )
+            .await?;
+
+            // Update asset with storage location
+            db::MediaAsset::update_status(&state.db, asset.id, "uploaded", Some(&location)).await?;
+
+            tracing::info!(
+                "File uploaded: {} by user {} (asset: {})",
+                file_name_owned,
+                auth_user.email,
+                asset.id
+            );
+
+            return Ok(Json(UploadResponse {
+                asset_id: asset.id.to_string(),
+                filename: file_name_owned,
+                size: data.len() as u64,
+                location,
+            }));
+        }
+    }
+
+    Err(AppError::BadRequest("No file provided".to_string()))
+}
+
+// ============================================================================
+// Processing Routes
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ConvertRequest {
+    pub asset_id: String,
+    pub output_format: String,
+    #[serde(default)]
+    pub width: Option<u32>,
+    #[serde(default)]
+    pub height: Option<u32>,
+}
+
+pub async fn convert(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+    Json(payload): Json<ConvertRequest>,
+) -> Result<Json<JobResponse>, AppError> {
+    let asset_id = Uuid::parse_str(&payload.asset_id)
+        .map_err(|_| AppError::BadRequest("Invalid asset ID".to_string()))?;
+
+    // Verify asset ownership
+    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+
+    if asset.user_id != auth_user.id {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    // Create job
+    let job = db::Job::create(
+        &state.db,
+        auth_user.id,
+        vec![asset_id],
+        "convert",
+        json!({
+            "output_format": payload.output_format,
+            "width": payload.width,
+            "height": payload.height,
+        }),
+        if auth_user.tier == "pro" { 10 } else { 0 },
+    )
+    .await?;
+
+    // Enqueue job
+    state
+        .queue
+        .enqueue(crate::services::JobMessage {
+            job_id: job.id.to_string(),
+            user_id: auth_user.id.to_string(),
+            job_type: "convert".to_string(),
+            media_location: asset.result_location.unwrap_or_default(),
+        })
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("Queue is full".to_string()))?;
+
+    tracing::info!(
+        "Conversion job {} queued for user {}",
+        job.id,
+        auth_user.email
+    );
+
+    Ok(Json(JobResponse {
+        job_id: job.id.to_string(),
+        status: "queued".to_string(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct RemoveBgRequest {
+    pub asset_id: String,
+    #[serde(default)]
+    pub replace_color: Option<[u8; 3]>,
+}
+
+pub async fn remove_bg(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+    Json(payload): Json<RemoveBgRequest>,
+) -> Result<Json<JobResponse>, AppError> {
+    let asset_id = Uuid::parse_str(&payload.asset_id)
+        .map_err(|_| AppError::BadRequest("Invalid asset ID".to_string()))?;
+
+    // Verify asset ownership
+    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+
+    if asset.user_id != auth_user.id {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    // Check quota
+    check_quota(&state, &auth_user, "video").await?;
+
+    // Create job
+    let job = db::Job::create(
+        &state.db,
+        auth_user.id,
+        vec![asset_id],
+        "remove_bg",
+        json!({
+            "replace_color": payload.replace_color,
+        }),
+        if auth_user.tier == "pro" { 10 } else { 0 },
+    )
+    .await?;
+
+    // Enqueue job
+    state
+        .queue
+        .enqueue(crate::services::JobMessage {
+            job_id: job.id.to_string(),
+            user_id: auth_user.id.to_string(),
+            job_type: "remove_bg".to_string(),
+            media_location: asset.result_location.unwrap_or_default(),
+        })
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("Queue is full".to_string()))?;
+
+    tracing::info!(
+        "Background removal job {} queued for user {}",
+        job.id,
+        auth_user.email
+    );
+
+    Ok(Json(JobResponse {
+        job_id: job.id.to_string(),
+        status: "queued".to_string(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ColorGradeRequest {
+    pub asset_id: String,
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub hue: Option<i32>,
+    #[serde(default)]
+    pub saturation: Option<i32>,
+    #[serde(default)]
+    pub brightness: Option<i32>,
+    #[serde(default)]
+    pub contrast: Option<i32>,
+}
+
+pub async fn color_grade(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+    Json(payload): Json<ColorGradeRequest>,
+) -> Result<Json<JobResponse>, AppError> {
+    let asset_id = Uuid::parse_str(&payload.asset_id)
+        .map_err(|_| AppError::BadRequest("Invalid asset ID".to_string()))?;
+
+    // Verify asset ownership
+    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+
+    if asset.user_id != auth_user.id {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    // Create job
+    let job = db::Job::create(
+        &state.db,
+        auth_user.id,
+        vec![asset_id],
+        "color_grade",
+        json!({
+            "preset": payload.preset,
+            "hue": payload.hue,
+            "saturation": payload.saturation,
+            "brightness": payload.brightness,
+            "contrast": payload.contrast,
+        }),
+        if auth_user.tier == "pro" { 10 } else { 0 },
+    )
+    .await?;
+
+    // Enqueue job
+    state
+        .queue
+        .enqueue(crate::services::JobMessage {
+            job_id: job.id.to_string(),
+            user_id: auth_user.id.to_string(),
+            job_type: "color_grade".to_string(),
+            media_location: asset.result_location.unwrap_or_default(),
+        })
+        .await
+        .map_err(|_| AppError::ServiceUnavailable("Queue is full".to_string()))?;
+
+    tracing::info!(
+        "Color grading job {} queued for user {}",
+        job.id,
+        auth_user.email
+    );
+
+    Ok(Json(JobResponse {
+        job_id: job.id.to_string(),
+        status: "queued".to_string(),
+    }))
+}
+
+// ============================================================================
+// Job Status Routes
+// ============================================================================
+
+pub async fn get_job_status(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<JobStatusResponse>, AppError> {
+    let job_uuid = Uuid::parse_str(&job_id)
+        .map_err(|_| AppError::BadRequest("Invalid job ID".to_string()))?;
+
+    let job = db::Job::find_by_id(&state.db, job_uuid)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Job not found".to_string()))?;
+
+    // Verify ownership
+    if job.user_id != auth_user.id {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    Ok(Json(JobStatusResponse {
+        job_id: job.id.to_string(),
+        status: job.status,
+        progress: job.progress_percent as u32,
+        result_url: job.result_location,
+        created_at: job.created_at.to_rfc3339(),
+        completed_at: job.completed_at.map(|t| t.to_rfc3339()),
+    }))
+}
+
+pub async fn list_user_jobs(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+) -> Result<Json<Vec<JobStatusResponse>>, AppError> {
+    let jobs = sqlx::query_as::<_, db::Job>(
+        "SELECT * FROM jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
+    )
+    .bind(auth_user.id)
+    .fetch_all(&state.db)
+    .await?;
+
+    let response: Vec<JobStatusResponse> = jobs
+        .into_iter()
+        .map(|job| JobStatusResponse {
+            job_id: job.id.to_string(),
+            status: job.status,
+            progress: job.progress_percent as u32,
+            result_url: job.result_location,
+            created_at: job.created_at.to_rfc3339(),
+            completed_at: job.completed_at.map(|t| t.to_rfc3339()),
+        })
+        .collect();
+
+    Ok(Json(response))
+}
+
+pub async fn download_result(
+    auth_user: auth::AuthUser,
+    Extension(state): Extension<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Response, AppError> {
+    let job_uuid = Uuid::parse_str(&job_id)
+        .map_err(|_| AppError::BadRequest("Invalid job ID".to_string()))?;
+
+    let job = db::Job::find_by_id(&state.db, job_uuid)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Job not found".to_string()))?;
+
+    // Verify ownership
+    if job.user_id != auth_user.id {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    if job.status != "completed" {
+        return Err(AppError::BadRequest("Job not completed".to_string()));
+    }
+
+    let result_location = job
+        .result_location
+        .ok_or_else(|| AppError::NotFound("Result not found".to_string()))?;
+
+    // Read file from storage
+    let file_data = std::fs::read(&result_location)
+        .map_err(|_| AppError::NotFound("File not found".to_string()))?;
+
+    // Determine content type from filename
+    let content_type = if result_location.ends_with(".png") {
+        "image/png"
+    } else if result_location.ends_with(".jpg") || result_location.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if result_location.ends_with(".webp") {
+        "image/webp"
+    } else if result_location.ends_with(".mp4") {
+        "video/mp4"
+    } else {
+        "application/octet-stream"
+    };
+
+    Ok((
+        StatusCode::OK,
+        [
+            ("Content-Type", content_type),
+            ("Content-Disposition", &format!("attachment; filename=\"{}\"", 
+                result_location.split('/').last().unwrap_or("result"))),
+        ],
+        file_data,
+    )
+        .into_response())
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+async fn check_quota(
+    state: &AppState,
+    user: &auth::AuthUser,
+    job_type: &str,
+) -> Result<(), AppError> {
+    let count = db::Job::get_user_jobs_today(&state.db, user.id, Some(job_type)).await?;
+
+    let limit = match (user.tier.as_str(), job_type) {
+        ("free", "image") => state.config.quotas.free_tier_image_daily as i64,
+        ("free", "video") => state.config.quotas.free_tier_video_daily as i64,
+        ("pro", "video") => state.config.quotas.pro_tier_video_daily as i64,
+        _ => i64::MAX,
+    };
+
+    if count >= limit {
+        return Err(AppError::QuotaExceeded(format!(
+            "Daily quota exceeded ({}/{}). Upgrade to Pro for unlimited access.",
+            count, limit
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_file(
+    filename: &str,
+    data: &[u8],
+    config: &crate::config::Config,
+) -> Result<(), AppError> {
+    let lower = filename.to_lowercase();
+    let size = data.len() as u64;
+
+    let is_image = lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".heic");
+
+    let is_video = lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".avi");
+
+    if !is_image && !is_video {
+        return Err(AppError::BadRequest(
+            "Unsupported file type. Supported: JPG, PNG, WEBP, GIF, HEIC, MP4, MOV, AVI"
+                .to_string(),
+        ));
+    }
+
+    let max_size_bytes = if is_image {
+        config.processing.max_image_size_mb * 1024 * 1024
+    } else {
+        config.processing.max_video_size_mb * 1024 * 1024
+    };
+
+    if size > max_size_bytes {
+        return Err(AppError::PayloadTooLarge(format!(
+            "File too large: {} MB (max {} MB)",
+            size / (1024 * 1024),
+            max_size_bytes / (1024 * 1024)
+        )));
+    }
+
+    Ok(())
+}
+
+fn get_file_extension(filename: &str) -> String {
+    filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("unknown")
+        .to_lowercase()
+}
+
+// ============================================================================
+// Response Types
+// ============================================================================
+
+#[derive(Serialize)]
+pub struct UploadResponse {
+    pub asset_id: String,
+    pub filename: String,
+    pub size: u64,
+    pub location: String,
+}
+
+#[derive(Serialize)]
+pub struct JobResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct JobStatusResponse {
+    pub job_id: String,
+    pub status: String,
+    pub progress: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_url: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
+// ============================================================================
+// Error Handling
+// ============================================================================
+
+#[derive(Debug)]
+pub enum AppError {
+    BadRequest(String),
+    Unauthorized(String),
+    Forbidden(String),
+    NotFound(String),
+    Conflict(String),
+    PayloadTooLarge(String),
+    QuotaExceeded(String),
+    ServiceUnavailable(String),
+    Internal(String),
+    Database(db::DbError),
+}
+
+impl From<db::DbError> for AppError {
+    fn from(err: db::DbError) -> Self {
+        AppError::Database(err)
+    }
+}
+
+impl From<sqlx::Error> for AppError {
+    fn from(err: sqlx::Error) -> Self {
+        AppError::Database(db::DbError::Connection(err))
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
+            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
+            AppError::QuotaExceeded(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
+            AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
+            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            AppError::Database(err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Database error: {:?}", err),
+            ),
+        };
+
+        (status, Json(json!({ "error": message }))).into_response()
+    }
+}

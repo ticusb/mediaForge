@@ -9,24 +9,40 @@ tokio = { version = "1.40", features = ["full"] }
 
 # Web framework
 axum = { version = "0.7", features = ["multipart"] }
-tower-http = { version = "0.5", features = ["cors", "fs"] }
-hyper = "1.4"
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+tower = { version = "0.5", features = ["limit", "timeout"] }
+hyper = { version = "1.4", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json", "migrate"] }
+
+# Redis for job queue (optional for MVP - can use in-memory)
+# redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Authentication
+jsonwebtoken = "9.3"
+bcrypt = "0.15"
+
+# Image Processing
+image = { version = "0.25", features = ["png", "jpeg", "webp"] }
+
 # Utilities
 uuid = { version = "1.10", features = ["v4", "serde"] }
 bytes = "1.7"
+chrono = { version = "0.4", features = ["serde"] }
+dotenv = "0.15"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
-# Optional: Better MIME type detection
-# infer = "0.16"
-
-# Optional: For production-ready error handling
-# thiserror = "1.0"
-# anyhow = "1.0"
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "multipart"] }
