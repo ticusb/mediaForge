@@ -1,24 +1,22 @@
 use axum::{
-    extract::{Path, Multipart},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    extract::{Multipart, Path, State},
     Json,
-    Extension,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{auth, db, AppState};
+use crate::{auth, db, error::{AppError, Result}, AppState};
 
 // ============================================================================
 // Health Check
 // ============================================================================
 
-pub async fn health() -> impl IntoResponse {
+pub async fn health() -> Json<serde_json::Value> {
     Json(json!({
         "status": "healthy",
-        "version": env!("CARGO_PKG_VERSION")
+        "version": env!("CARGO_PKG_VERSION"),
+        "service": "MediaForge API"
     }))
 }
 
@@ -27,12 +25,21 @@ pub async fn health() -> impl IntoResponse {
 // ============================================================================
 
 pub async fn register(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<auth::RegisterRequest>,
-) -> Result<Json<auth::AuthResponse>, AppError> {
+) -> Result<Json<auth::AuthResponse>> {
     // Validate email format
-    if !payload.email.contains('@') {
-        return Err(AppError::BadRequest("Invalid email format".to_string()));
+    if !payload.email.contains('@') || payload.email.len() < 5 {
+        return Err(AppError::BadRequest(
+            "Invalid email format".to_string(),
+        ));
+    }
+
+    // Validate password strength
+    if payload.password.len() < 8 {
+        return Err(AppError::BadRequest(
+            "Password must be at least 8 characters".to_string(),
+        ));
     }
 
     // Check if user exists
@@ -40,12 +47,14 @@ pub async fn register(
         .await?
         .is_some()
     {
-        return Err(AppError::Conflict("Email already registered".to_string()));
+        return Err(AppError::Conflict(
+            "Email already registered".to_string(),
+        ));
     }
 
     // Hash password
     let password_hash = auth::hash_password(&payload.password)
-        .map_err(|_| AppError::Internal("Failed to hash password".to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Failed to hash password: {}", e)))?;
 
     // Create user (default to free tier)
     let user = db::User::create(&state.db, &payload.email, &password_hash, "free").await?;
@@ -54,7 +63,9 @@ pub async fn register(
     let claims = auth::Claims::new(user.id, user.email.clone(), user.subscription_tier.clone());
     let token = claims
         .to_token(&state.config.jwt_secret)
-        .map_err(|_| AppError::Internal("Failed to generate token".to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Failed to generate token: {}", e)))?;
+
+    tracing::info!("User registered: {} ({})", user.email, user.id);
 
     Ok(Json(auth::AuthResponse {
         token,
@@ -67,9 +78,9 @@ pub async fn register(
 }
 
 pub async fn login(
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<auth::LoginRequest>,
-) -> Result<Json<auth::AuthResponse>, AppError> {
+) -> Result<Json<auth::AuthResponse>> {
     // Find user
     let user = db::User::find_by_email(&state.db, &payload.email)
         .await?
@@ -77,7 +88,7 @@ pub async fn login(
 
     // Verify password
     let valid = auth::verify_password(&payload.password, &user.password_hash)
-        .map_err(|_| AppError::Internal("Password verification failed".to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Password verification failed: {}", e)))?;
 
     if !valid {
         return Err(AppError::Unauthorized("Invalid credentials".to_string()));
@@ -87,7 +98,9 @@ pub async fn login(
     let claims = auth::Claims::new(user.id, user.email.clone(), user.subscription_tier.clone());
     let token = claims
         .to_token(&state.config.jwt_secret)
-        .map_err(|_| AppError::Internal("Failed to generate token".to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Failed to generate token: {}", e)))?;
+
+    tracing::info!("User logged in: {} ({})", user.email, user.id);
 
     Ok(Json(auth::AuthResponse {
         token,
@@ -103,18 +116,23 @@ pub async fn login(
 // Upload Route
 // ============================================================================
 
+#[derive(Serialize)]
+pub struct UploadResponse {
+    pub asset_id: String,
+    pub filename: String,
+    pub size: u64,
+    pub location: String,
+}
+
 pub async fn upload(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     mut multipart: Multipart,
-) -> Result<Json<UploadResponse>, AppError> {
-    // Check quota
-    check_quota(&state, &auth_user, "image").await?;
-
+) -> Result<Json<UploadResponse>> {
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|_| AppError::BadRequest("Invalid multipart data".to_string()))?
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart data: {}", e)))?
     {
         if let Some(file_name) = field.file_name() {
             let file_name_owned = file_name.to_string();
@@ -123,7 +141,7 @@ pub async fn upload(
             let data = field
                 .bytes()
                 .await
-                .map_err(|_| AppError::BadRequest("Failed to read file".to_string()))?;
+                .map_err(|e| AppError::BadRequest(format!("Failed to read file: {}", e)))?;
 
             // Validate file
             validate_file(&file_name_owned, &data, &state.config)?;
@@ -132,7 +150,7 @@ pub async fn upload(
             let location = state
                 .storage
                 .save_bytes(&data, &file_name_owned)
-                .map_err(|_| AppError::Internal("Failed to save file".to_string()))?;
+                .map_err(|e| AppError::Internal(format!("Failed to save file: {:?}", e)))?;
 
             // Create media asset record
             let asset = db::MediaAsset::create(
@@ -145,7 +163,8 @@ pub async fn upload(
             .await?;
 
             // Update asset with storage location
-            db::MediaAsset::update_status(&state.db, asset.id, "uploaded", Some(&location)).await?;
+            db::MediaAsset::update_status(&state.db, asset.id, "uploaded", Some(&location))
+                .await?;
 
             tracing::info!(
                 "File uploaded: {} by user {} (asset: {})",
@@ -180,24 +199,25 @@ pub struct ConvertRequest {
     pub height: Option<u32>,
 }
 
+#[derive(Serialize)]
+pub struct JobResponse {
+    pub job_id: String,
+    pub status: String,
+}
+
 pub async fn convert(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<ConvertRequest>,
-) -> Result<Json<JobResponse>, AppError> {
+) -> Result<Json<JobResponse>> {
     let asset_id = Uuid::parse_str(&payload.asset_id)
         .map_err(|_| AppError::BadRequest("Invalid asset ID".to_string()))?;
 
     // Verify asset ownership
-    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
-        .bind(asset_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+    let asset = verify_asset_ownership(&state.db, asset_id, auth_user.id).await?;
 
-    if asset.user_id != auth_user.id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
+    // Check quota
+    check_quota(&state, &auth_user, "image").await?;
 
     // Create job
     let job = db::Job::create(
@@ -247,27 +267,17 @@ pub struct RemoveBgRequest {
 
 pub async fn remove_bg(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<RemoveBgRequest>,
-) -> Result<Json<JobResponse>, AppError> {
+) -> Result<Json<JobResponse>> {
     let asset_id = Uuid::parse_str(&payload.asset_id)
         .map_err(|_| AppError::BadRequest("Invalid asset ID".to_string()))?;
 
-    // Verify asset ownership
-    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
-        .bind(asset_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+    let asset = verify_asset_ownership(&state.db, asset_id, auth_user.id).await?;
 
-    if asset.user_id != auth_user.id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
-
-    // Check quota
+    // Check quota for video processing
     check_quota(&state, &auth_user, "video").await?;
 
-    // Create job
     let job = db::Job::create(
         &state.db,
         auth_user.id,
@@ -280,7 +290,6 @@ pub async fn remove_bg(
     )
     .await?;
 
-    // Enqueue job
     state
         .queue
         .enqueue(crate::services::JobMessage {
@@ -321,24 +330,14 @@ pub struct ColorGradeRequest {
 
 pub async fn color_grade(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Json(payload): Json<ColorGradeRequest>,
-) -> Result<Json<JobResponse>, AppError> {
+) -> Result<Json<JobResponse>> {
     let asset_id = Uuid::parse_str(&payload.asset_id)
         .map_err(|_| AppError::BadRequest("Invalid asset ID".to_string()))?;
 
-    // Verify asset ownership
-    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
-        .bind(asset_id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+    let asset = verify_asset_ownership(&state.db, asset_id, auth_user.id).await?;
 
-    if asset.user_id != auth_user.id {
-        return Err(AppError::Forbidden("Access denied".to_string()));
-    }
-
-    // Create job
     let job = db::Job::create(
         &state.db,
         auth_user.id,
@@ -355,7 +354,6 @@ pub async fn color_grade(
     )
     .await?;
 
-    // Enqueue job
     state
         .queue
         .enqueue(crate::services::JobMessage {
@@ -383,11 +381,23 @@ pub async fn color_grade(
 // Job Status Routes
 // ============================================================================
 
+#[derive(Serialize)]
+pub struct JobStatusResponse {
+    pub job_id: String,
+    pub status: String,
+    pub progress: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_url: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+}
+
 pub async fn get_job_status(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Path(job_id): Path<String>,
-) -> Result<Json<JobStatusResponse>, AppError> {
+) -> Result<Json<JobStatusResponse>> {
     let job_uuid = Uuid::parse_str(&job_id)
         .map_err(|_| AppError::BadRequest("Invalid job ID".to_string()))?;
 
@@ -412,8 +422,8 @@ pub async fn get_job_status(
 
 pub async fn list_user_jobs(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
-) -> Result<Json<Vec<JobStatusResponse>>, AppError> {
+    State(state): State<AppState>,
+) -> Result<Json<Vec<JobStatusResponse>>> {
     let jobs = sqlx::query_as::<_, db::Job>(
         "SELECT * FROM jobs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50",
     )
@@ -438,9 +448,9 @@ pub async fn list_user_jobs(
 
 pub async fn download_result(
     auth_user: auth::AuthUser,
-    Extension(state): Extension<AppState>,
+    State(state): State<AppState>,
     Path(job_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> Result<impl axum::response::IntoResponse> {
     let job_uuid = Uuid::parse_str(&job_id)
         .map_err(|_| AppError::BadRequest("Invalid job ID".to_string()))?;
 
@@ -462,49 +472,59 @@ pub async fn download_result(
         .ok_or_else(|| AppError::NotFound("Result not found".to_string()))?;
 
     // Read file from storage
-    let file_data = std::fs::read(&result_location)
+    let file_data = tokio::fs::read(&result_location)
+        .await
         .map_err(|_| AppError::NotFound("File not found".to_string()))?;
 
     // Determine content type from filename
-    let content_type = if result_location.ends_with(".png") {
-        "image/png"
-    } else if result_location.ends_with(".jpg") || result_location.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if result_location.ends_with(".webp") {
-        "image/webp"
-    } else if result_location.ends_with(".mp4") {
-        "video/mp4"
-    } else {
-        "application/octet-stream"
-    };
+    let content_type = get_content_type(&result_location);
+    let filename = result_location
+        .split('/')
+        .last()
+        .unwrap_or("result");
 
+    let disposition = format!("attachment; filename=\"{}\"", filename);
+    
     Ok((
-        StatusCode::OK,
+        axum::http::StatusCode::OK,
         [
             ("Content-Type", content_type),
-            ("Content-Disposition", &format!("attachment; filename=\"{}\"", 
-                result_location.split('/').last().unwrap_or("result"))),
+            ("Content-Disposition", &disposition),
         ],
         file_data,
-    )
-        .into_response())
+    ))
 }
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
-async fn check_quota(
-    state: &AppState,
-    user: &auth::AuthUser,
-    job_type: &str,
-) -> Result<(), AppError> {
+async fn verify_asset_ownership(
+    db: &sqlx::PgPool,
+    asset_id: Uuid,
+    user_id: Uuid,
+) -> Result<db::MediaAsset> {
+    let asset = sqlx::query_as::<_, db::MediaAsset>("SELECT * FROM media_assets WHERE id = $1")
+        .bind(asset_id)
+        .fetch_optional(db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Asset not found".to_string()))?;
+
+    if asset.user_id != user_id {
+        return Err(AppError::Forbidden("Access denied".to_string()));
+    }
+
+    Ok(asset)
+}
+
+async fn check_quota(state: &AppState, user: &auth::AuthUser, job_type: &str) -> Result<()> {
     let count = db::Job::get_user_jobs_today(&state.db, user.id, Some(job_type)).await?;
 
     let limit = match (user.tier.as_str(), job_type) {
         ("free", "image") => state.config.quotas.free_tier_image_daily as i64,
         ("free", "video") => state.config.quotas.free_tier_video_daily as i64,
         ("pro", "video") => state.config.quotas.pro_tier_video_daily as i64,
+        ("pro", "image") => i64::MAX, // Unlimited for pro
         _ => i64::MAX,
     };
 
@@ -522,7 +542,7 @@ fn validate_file(
     filename: &str,
     data: &[u8],
     config: &crate::config::Config,
-) -> Result<(), AppError> {
+) -> Result<()> {
     let lower = filename.to_lowercase();
     let size = data.len() as u64;
 
@@ -533,11 +553,14 @@ fn validate_file(
         || lower.ends_with(".gif")
         || lower.ends_with(".heic");
 
-    let is_video = lower.ends_with(".mp4") || lower.ends_with(".mov") || lower.ends_with(".avi");
+    let is_video = lower.ends_with(".mp4") 
+        || lower.ends_with(".mov") 
+        || lower.ends_with(".avi")
+        || lower.ends_with(".webm");
 
     if !is_image && !is_video {
         return Err(AppError::BadRequest(
-            "Unsupported file type. Supported: JPG, PNG, WEBP, GIF, HEIC, MP4, MOV, AVI"
+            "Unsupported file type. Supported: JPG, PNG, WEBP, GIF, HEIC, MP4, MOV, AVI, WEBM"
                 .to_string(),
         ));
     }
@@ -567,84 +590,26 @@ fn get_file_extension(filename: &str) -> String {
         .to_lowercase()
 }
 
-// ============================================================================
-// Response Types
-// ============================================================================
-
-#[derive(Serialize)]
-pub struct UploadResponse {
-    pub asset_id: String,
-    pub filename: String,
-    pub size: u64,
-    pub location: String,
-}
-
-#[derive(Serialize)]
-pub struct JobResponse {
-    pub job_id: String,
-    pub status: String,
-}
-
-#[derive(Serialize)]
-pub struct JobStatusResponse {
-    pub job_id: String,
-    pub status: String,
-    pub progress: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_url: Option<String>,
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-}
-
-// ============================================================================
-// Error Handling
-// ============================================================================
-
-#[derive(Debug)]
-pub enum AppError {
-    BadRequest(String),
-    Unauthorized(String),
-    Forbidden(String),
-    NotFound(String),
-    Conflict(String),
-    PayloadTooLarge(String),
-    QuotaExceeded(String),
-    ServiceUnavailable(String),
-    Internal(String),
-    Database(db::DbError),
-}
-
-impl From<db::DbError> for AppError {
-    fn from(err: db::DbError) -> Self {
-        AppError::Database(err)
-    }
-}
-
-impl From<sqlx::Error> for AppError {
-    fn from(err: sqlx::Error) -> Self {
-        AppError::Database(db::DbError::Connection(err))
-    }
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
-            AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
-            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
-            AppError::PayloadTooLarge(msg) => (StatusCode::PAYLOAD_TOO_LARGE, msg),
-            AppError::QuotaExceeded(msg) => (StatusCode::TOO_MANY_REQUESTS, msg),
-            AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            AppError::Database(err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {:?}", err),
-            ),
-        };
-
-        (status, Json(json!({ "error": message }))).into_response()
+fn get_content_type(filename: &str) -> &'static str {
+    let lower = filename.to_lowercase();
+    
+    if lower.ends_with(".png") {
+        "image/png"
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if lower.ends_with(".webp") {
+        "image/webp"
+    } else if lower.ends_with(".gif") {
+        "image/gif"
+    } else if lower.ends_with(".mp4") {
+        "video/mp4"
+    } else if lower.ends_with(".mov") {
+        "video/quicktime"
+    } else if lower.ends_with(".avi") {
+        "video/x-msvideo"
+    } else if lower.ends_with(".webm") {
+        "video/webm"
+    } else {
+        "application/octet-stream"
     }
 }
