@@ -488,13 +488,12 @@ pub async fn download_result(
     Ok((
         axum::http::StatusCode::OK,
         [
-            ("Content-Type", content_type),
-            ("Content-Disposition", &disposition),
+            ("Content-Type", content_type.to_string()),
+            ("Content-Disposition", disposition),
         ],
         file_data,
     ))
 }
-
 // ============================================================================
 // Helper Functions
 // ============================================================================

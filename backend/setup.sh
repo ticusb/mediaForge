@@ -14,7 +14,7 @@ if ! command -v psql &> /dev/null; then
 fi
 
 # Configuration
-DB_NAME="mediaforge"
+DB_NAME="mediaForge"
 DB_USER="postgres"
 DB_PASSWORD="password"
 DB_HOST="localhost"
