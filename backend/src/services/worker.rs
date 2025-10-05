@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{db, services, config};
+use crate::{db, config};
 use super::queue::{JobMessage, JobStatus};
 use super::processing::ImageProcessor;
 use super::Storage;

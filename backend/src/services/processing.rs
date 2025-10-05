@@ -1,7 +1,7 @@
 // backend/src/services/processing.rs
 // Self-hosted background removal and image processing
 
-use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage, GenericImageView};
+use image::{DynamicImage, Rgba, RgbaImage, GenericImageView};
 use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
